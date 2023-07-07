@@ -25,11 +25,14 @@ Ray marching in JAX
 Author: Hongrui Zheng
 """
 
-import numpy as np
-import jax.numpy as jnp
-import jax
-from scipy.ndimage import distance_transform_edt as edt
 import os
+from functools import partial
+
+import chex
+import jax
+import jax.numpy as jnp
+import numpy as np
+from scipy.ndimage import distance_transform_edt as edt
 
 os.environ["XLA_PYTHON_CLIENT_PREALLOCATE"] = "false"
 
@@ -51,6 +54,7 @@ def get_dt(bitmap, resolution):
 
 
 @jax.jit
+@chex.assert_max_traces(n=2)
 def xy_2_rc(x, y, orig_x, orig_y, orig_c, orig_s, height, width, resolution):
     """
     Translate (x, y) coordinate into (r, c) in the matrix
@@ -90,6 +94,7 @@ def xy_2_rc(x, y, orig_x, orig_y, orig_c, orig_s, height, width, resolution):
 
 
 @jax.jit
+@chex.assert_max_traces(n=2)
 def distance_transform(
     x, y, orig_x, orig_y, orig_c, orig_s, height, width, resolution, dt
 ):
@@ -110,7 +115,8 @@ def distance_transform(
     return distance
 
 
-@jax.jit
+@partial(jax.jit, static_argnums=[3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14])
+@chex.assert_max_traces(n=2)
 def trace_ray(
     x,
     y,
@@ -191,7 +197,10 @@ def trace_ray(
     return total_dist
 
 
-@jax.jit
+@partial(
+    jax.jit, static_argnums=[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16]
+)
+@chex.assert_max_traces(n=2)
 def get_scan(
     pose,
     theta_dis,
@@ -231,10 +240,34 @@ def get_scan(
     theta_index = theta_dis * (pose[2] - fov / 2.0) / (2.0 * np.pi)
 
     # make sure it's wrapped properly
-    theta_index = np.fmod(theta_index, theta_dis)
+    theta_index = jnp.fmod(theta_index, theta_dis)
     while theta_index < 0:
         theta_index += theta_dis
 
+    # vmap to vectorize each ray march
+    # vectorized over multiple theta_index inputs
+    trace_ray_vmap = jax.vmap(
+        trace_ray,
+        (
+            None,
+            None,
+            0,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ),
+    )
+
+    # TODO: vmap to vectorize each beam
     # sweep through each beam
     for i in range(0, num_beams):
         # trace the current beam
