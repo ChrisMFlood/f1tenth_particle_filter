@@ -21,18 +21,45 @@
 # SOFTWARE.
 
 """
-Particle Filter with RM
-Author: Hongrui Zheng
+ROS 2 Node of Particle Filter with 2D Laserscan
 """
 
-from dataclasses import dataclass, field
+# ros2 python
+import rclpy
+from rclpy.node import Node
 
-import jax
-import jax.numpy as jnp
+# libraries
 import numpy as np
-
+import range_libc
+import time
+from threading import Lock
 from particle_filter import utils as Utils
-from particle_filter.jax_rm import get_dt, get_scan
+
+# TF
+# import tf.transformations
+# import tf
+from tf2_ros import TransformBroadcaster
+import tf_transformations
+
+# messages
+from std_msgs.msg import String, Header, Float32MultiArray
+from sensor_msgs.msg import LaserScan
+from visualization_msgs.msg import Marker
+from geometry_msgs.msg import (
+    Point,
+    Pose,
+    PoseStamped,
+    PoseArray,
+    Quaternion,
+    PolygonStamped,
+    Polygon,
+    Point32,
+    PoseWithCovarianceStamped,
+    PointStamped,
+    TransformStamped,
+)
+from nav_msgs.msg import Odometry
+from nav_msgs.srv import GetMap
 
 """
 These flags indicate several variants of the sensor model. Only one of them is used at a time.
@@ -43,31 +70,64 @@ VAR_REPEAT_ANGLES_EVAL_SENSOR = 2
 VAR_REPEAT_ANGLES_EVAL_SENSOR_ONE_SHOT = 3
 VAR_RADIAL_CDDT_OPTIMIZATIONS = 4
 
-@dataclass
-class pf_config:
-    angle_step: int = 18
-    max_particles: int = 4000
-    squash_factor: float = 2.2
-    theta_discretization: int = 112
-    max_range: float = 10
-    fine_timing: float = 0
-    z_short: float = 0.01
-    z_max: float = 0.07
-    z_rand: float = 0.12
-    z_hit: float = 0.75
-    sigma_hit: float = 8.0
-    motion_dispersion_x: float = 0.05
-    motion_dispersion_y: float = 0.025
-    motion_dispersion_theta: float = 0.25
 
-class ParticleFiler(object):
+class ParticleFiler(Node):
     """
     This class implements Monte Carlo Localization based on odometry and a laser scanner.
     """
 
-    def __init__(self, config=pf_config()):
+    def __init__(self):
+        super().__init__("particle_filter")
+
+        # declare parameters
+        self.declare_parameter("angle_step")
+        self.declare_parameter("max_particles")
+        self.declare_parameter("max_viz_particles")
+        self.declare_parameter("squash_factor")
+        self.declare_parameter("max_range")
+        self.declare_parameter("theta_discretization")
+        self.declare_parameter("range_method")
+        self.declare_parameter("rangelib_variant")
+        self.declare_parameter("fine_timing")
+        self.declare_parameter("publish_odom")
+        self.declare_parameter("viz")
+        self.declare_parameter("z_short")
+        self.declare_parameter("z_max")
+        self.declare_parameter("z_rand")
+        self.declare_parameter("z_hit")
+        self.declare_parameter("sigma_hit")
+        self.declare_parameter("motion_dispersion_x")
+        self.declare_parameter("motion_dispersion_y")
+        self.declare_parameter("motion_dispersion_theta")
+        self.declare_parameter("scan_topic")
+        self.declare_parameter("odometry_topic")
+
         # parameters
-        self.config = config
+        self.ANGLE_STEP = self.get_parameter("angle_step").value
+        self.MAX_PARTICLES = self.get_parameter("max_particles").value
+        self.MAX_VIZ_PARTICLES = self.get_parameter("max_viz_particles").value
+        self.INV_SQUASH_FACTOR = 1.0 / self.get_parameter("squash_factor").value
+        self.MAX_RANGE_METERS = self.get_parameter("max_range").value
+        self.THETA_DISCRETIZATION = self.get_parameter("theta_discretization").value
+        self.WHICH_RM = self.get_parameter("range_method").value
+        self.RANGELIB_VAR = self.get_parameter("rangelib_variant").value
+        self.SHOW_FINE_TIMING = self.get_parameter("fine_timing").value
+        self.PUBLISH_ODOM = self.get_parameter("publish_odom").value
+        self.DO_VIZ = self.get_parameter("viz").value
+
+        # sensor model constants
+        self.Z_SHORT = self.get_parameter("z_short").value
+        self.Z_MAX = self.get_parameter("z_max").value
+        self.Z_RAND = self.get_parameter("z_rand").value
+        self.Z_HIT = self.get_parameter("z_hit").value
+        self.SIGMA_HIT = self.get_parameter("sigma_hit").value
+
+        # motion model constants
+        self.MOTION_DISPERSION_X = self.get_parameter("motion_dispersion_x").value
+        self.MOTION_DISPERSION_Y = self.get_parameter("motion_dispersion_y").value
+        self.MOTION_DISPERSION_THETA = self.get_parameter(
+            "motion_dispersion_theta"
+        ).value
 
         # various data containers used in the MCL algorithm
         self.MAX_RANGE_PX = None
@@ -85,9 +145,10 @@ class ParticleFiler(object):
         self.last_time = None
         self.last_stamp = None
         self.first_sensor_update = True
+        self.state_lock = Lock()
 
         # cache this to avoid memory allocation in motion model
-        self.local_deltas = np.zeros((self.config.max_particles, 3))
+        self.local_deltas = np.zeros((self.MAX_PARTICLES, 3))
 
         # cache this for the sensor model computation
         self.queries = None
@@ -97,25 +158,198 @@ class ParticleFiler(object):
 
         # particle poses and weights
         self.inferred_pose = None
-        self.particle_indices = np.arange(self.config.max_particles)
-        self.particles = np.zeros((self.config.max_particles, 3))
-        self.weights = np.ones(self.config.max_particles) / float(self.config.max_particles)
+        self.particle_indices = np.arange(self.MAX_PARTICLES)
+        self.particles = np.zeros((self.MAX_PARTICLES, 3))
+        self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
 
+        # initialize the state
+        self.smoothing = Utils.CircularArray(10)
+        self.timer = Utils.Timer(10)
+        # map service client
+        self.map_client = self.create_client(GetMap, "/map_server/map")
+        self.get_omap()
         self.precompute_sensor_model()
         self.initialize_global()
 
         # keep track of speed from input odom
         self.current_speed = 0.0
 
+        # Pub Subs
+        # these topics are for visualization
+        self.pose_pub = self.create_publisher(PoseStamped, "/pf/viz/inferred_pose", 1)
+        self.particle_pub = self.create_publisher(PoseArray, "/pf/viz/particles", 1)
+        self.pub_fake_scan = self.create_publisher(LaserScan, "/pf/viz/fake_scan", 1)
+        self.rect_pub = self.create_publisher(PolygonStamped, "/pf/viz/poly1", 1)
 
-    def set_omap(self, bitmap, metadata):
-        """
-        Sets the occupancy map for the pf object
-        """
-        self.map = bitmap
-        # TODO: fix image orientation, see laser_models
-        self.dt = get_dt(bitmap, metadata['resolution'])
+        if self.PUBLISH_ODOM:
+            self.odom_pub = self.create_publisher(Odometry, "/pf/pose/odom", 1)
 
+        # these topics are for coordinate space things
+        self.pub_tf = TransformBroadcaster(self)
+
+        # these topics are to receive data from the racecar
+        self.laser_sub = self.create_subscription(
+            LaserScan, self.get_parameter("scan_topic").value, self.lidarCB, 1
+        )
+        self.odom_sub = self.create_subscription(
+            Odometry, self.get_parameter("odometry_topic").value, self.odomCB, 1
+        )
+        self.pose_sub = self.create_subscription(
+            PoseWithCovarianceStamped, "/initialpose", self.clicked_pose, 1
+        )
+        self.click_sub = self.create_subscription(
+            PointStamped, "/clicked_point", self.clicked_pose, 1
+        )
+
+        self.get_logger().info("Finished initializing, waiting on messages...")
+
+    def get_omap(self):
+        """
+        Fetch the occupancy grid map from the map_server instance, and initialize the correct
+        RangeLibc method. Also stores a matrix which indicates the permissible region of the map
+        """
+
+        while not self.map_client.wait_for_service(timeout_sec=1.0):
+            self.get_logger().info("Get map service not available, waiting...")
+        req = GetMap.Request()
+        future = self.map_client.call_async(req)
+        rclpy.spin_until_future_complete(self, future)
+        map_msg = future.result().map
+        self.map_info = map_msg.info
+
+        oMap = range_libc.PyOMap(map_msg)
+        self.MAX_RANGE_PX = int(self.MAX_RANGE_METERS / self.map_info.resolution)
+
+        # initialize range method
+        self.get_logger().info("Initializing range method: " + self.WHICH_RM)
+        if self.WHICH_RM == "bl":
+            self.range_method = range_libc.PyBresenhamsLine(oMap, self.MAX_RANGE_PX)
+        elif "cddt" in self.WHICH_RM:
+            self.range_method = range_libc.PyCDDTCast(
+                oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION
+            )
+            if self.WHICH_RM == "pcddt":
+                self.get_logger().info("Pruning...")
+                self.range_method.prune()
+        elif self.WHICH_RM == "rm":
+            self.range_method = range_libc.PyRayMarching(oMap, self.MAX_RANGE_PX)
+        elif self.WHICH_RM == "rmgpu":
+            self.range_method = range_libc.PyRayMarchingGPU(oMap, self.MAX_RANGE_PX)
+        elif self.WHICH_RM == "glt":
+            self.range_method = range_libc.PyGiantLUTCast(
+                oMap, self.MAX_RANGE_PX, self.THETA_DISCRETIZATION
+            )
+        self.get_logger().info("Done loading map")
+
+        # 0: permissible, -1: unmapped, 100: blocked
+        array_255 = np.array(map_msg.data).reshape(
+            (map_msg.info.height, map_msg.info.width)
+        )
+
+        # 0: not permissible, 1: permissible
+        self.permissible_region = np.zeros_like(array_255, dtype=bool)
+        self.permissible_region[array_255 == 0] = 1
+        self.map_initialized = True
+
+    def publish_tf(self, pose, stamp=None):
+        """Publish a tf for the car. This tells ROS where the car is with respect to the map."""
+        if stamp == None:
+            stamp = self.get_clock().now().to_msg()
+
+        t = TransformStamped()
+        # header
+        t.header.stamp = stamp
+        t.header.frame_id = "/map"
+        t.child_frame_id = "/laser"
+        # translation
+        t.transform.translation.x = pose[0]
+        t.transform.translation.y = pose[1]
+        t.transform.translation.z = 0.0
+        q = tf_transformations.quaternion_from_euler(0.0, 0.0, pose[2])
+        # rotation
+        t.transform.rotation.x = q[0]
+        t.transform.rotation.y = q[1]
+        t.transform.rotation.z = q[2]
+        t.transform.rotation.w = q[3]
+        self.pub_tf.sendTransform(t)
+        # also publish odometry to facilitate getting the localization pose
+        if self.PUBLISH_ODOM:
+            odom = Odometry()
+            odom.header.stamp = self.get_clock().now().to_msg()
+            odom.header.frame_id = "/map"
+            odom.pose.pose.position.x = pose[0]
+            odom.pose.pose.position.y = pose[1]
+            odom.pose.pose.orientation = Utils.angle_to_quaternion(pose[2])
+            cov_mat = np.cov(
+                self.particles, rowvar=False, ddof=0, aweights=self.weights
+            ).flatten()
+            odom.pose.covariance[: cov_mat.shape[0]] = cov_mat
+            odom.twist.twist.linear.x = self.current_speed
+            self.odom_pub.publish(odom)
+
+        return
+
+    def visualize(self):
+        """
+        Publish various visualization messages.
+        """
+        if not self.DO_VIZ:
+            return
+
+        if self.pose_pub.get_subscription_count() > 0 and isinstance(
+            self.inferred_pose, np.ndarray
+        ):
+            # Publish the inferred pose for visualization
+            ps = PoseStamped()
+            ps.header.stamp = self.get_clock().now().to_msg()
+            ps.header.frame_id = "/map"
+            ps.pose.position.x = self.inferred_pose[0]
+            ps.pose.position.y = self.inferred_pose[1]
+            ps.pose.orientation = Utils.angle_to_quaternion(self.inferred_pose[2])
+            self.pose_pub.publish(ps)
+
+        if self.particle_pub.get_subscription_count() > 0:
+            # publish a downsampled version of the particle distribution to avoid a lot of latency
+            if self.MAX_PARTICLES > self.MAX_VIZ_PARTICLES:
+                # randomly downsample particles
+                proposal_indices = np.random.choice(
+                    self.particle_indices, self.MAX_VIZ_PARTICLES, p=self.weights
+                )
+                # proposal_indices = np.random.choice(self.particle_indices, self.MAX_VIZ_PARTICLES)
+                self.publish_particles(self.particles[proposal_indices, :])
+            else:
+                self.publish_particles(self.particles)
+
+        if self.pub_fake_scan.get_subscription_count() > 0 and isinstance(
+            self.ranges, np.ndarray
+        ):
+            # generate the scan from the point of view of the inferred position for visualization
+            self.viz_queries[:, 0] = self.inferred_pose[0]
+            self.viz_queries[:, 1] = self.inferred_pose[1]
+            self.viz_queries[:, 2] = self.downsampled_angles + self.inferred_pose[2]
+            self.range_method.calc_range_many(self.viz_queries, self.viz_ranges)
+            self.publish_scan(self.downsampled_angles, self.viz_ranges)
+
+    def publish_particles(self, particles):
+        # publish the given particles as a PoseArray object
+        pa = PoseArray()
+        pa.header.stamp = self.get_clock().now().to_msg()
+        pa.header.frame_id = "/map"
+        pa.poses = Utils.particles_to_poses(particles)
+        self.particle_pub.publish(pa)
+
+    def publish_scan(self, angles, ranges):
+        # publish the given angels and ranges as a laser scan message
+        ls = LaserScan()
+        ls.header.stamp = self.last_stamp
+        ls.header.frame_id = "/laser"
+        ls.angle_min = np.min(angles)
+        ls.angle_max = np.max(angles)
+        ls.angle_increment = np.abs(angles[0] - angles[1])
+        ls.range_min = 0
+        ls.range_max = np.max(ranges)
+        ls.ranges = ranges
+        self.pub_fake_scan.publish(ls)
 
     def lidarCB(self, msg):
         """

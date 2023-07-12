@@ -233,16 +233,22 @@ def get_scan(
         Returns:
             scan (numpy.ndarray(n, )): resulting laser scan at the pose, n=num_beams
     """
-    # empty scan array init
-    scan = np.empty((num_beams,))
 
     # make theta discrete by mapping the range [-pi, pi] onto [0, theta_dis]
     theta_index = theta_dis * (pose[2] - fov / 2.0) / (2.0 * np.pi)
 
     # make sure it's wrapped properly
     theta_index = jnp.fmod(theta_index, theta_dis)
-    while theta_index < 0:
+    if theta_index < 0:
         theta_index += theta_dis
+
+    theta_indices = jnp.linspace(
+        start=theta_index,
+        stop=theta_index + theta_index_increment * num_beams,
+        num=num_beams,
+        endpoint=True,
+        dtype=int,
+    )[:, None]
 
     # vmap to vectorize each ray march
     # vectorized over multiple theta_index inputs
@@ -266,34 +272,22 @@ def get_scan(
             None,
         ),
     )
-
-    # TODO: vmap to vectorize each beam
-    # sweep through each beam
-    for i in range(0, num_beams):
-        # trace the current beam
-        scan[i] = trace_ray(
-            pose[0],
-            pose[1],
-            theta_index,
-            sines,
-            cosines,
-            eps,
-            orig_x,
-            orig_y,
-            orig_c,
-            orig_s,
-            height,
-            width,
-            resolution,
-            dt,
-            max_range,
-        )
-
-        # increment the beam index
-        theta_index += theta_index_increment
-
-        # make sure it stays in the range [0, theta_dis)
-        while theta_index >= theta_dis:
-            theta_index -= theta_dis
+    scan = trace_ray_vmap(
+        pose[0],
+        pose[1],
+        theta_indices,
+        sines,
+        cosines,
+        eps,
+        orig_x,
+        orig_y,
+        orig_c,
+        orig_s,
+        height,
+        width,
+        resolution,
+        dt,
+        max_range,
+    )
 
     return scan
