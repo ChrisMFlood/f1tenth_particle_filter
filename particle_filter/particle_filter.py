@@ -70,7 +70,7 @@ class ParticleFiler(object):
         self.config = config
 
         # various data containers used in the MCL algorithm
-        self.MAX_RANGE_PX = None
+        self.max_range_px = None
         self.odometry_data = np.array([0.0, 0.0, 0.0])
         self.laser = None
         self.iters = 0
@@ -115,6 +115,7 @@ class ParticleFiler(object):
         self.map = bitmap
         # TODO: fix image orientation, see laser_models
         self.dt = get_dt(bitmap, metadata['resolution'])
+        self.max_range_px = self.config.max_range / metadata['resolution']
 
 
     def lidarCB(self, msg):
@@ -173,22 +174,12 @@ class ParticleFiler(object):
         # this topic is slower than lidar, so update every time we receive a message
         self.update()
 
-    def clicked_pose(self, msg):
-        """
-        Receive pose messages from RViz and initialize the particle distribution in response.
-        """
-        if isinstance(msg, PointStamped):
-            self.initialize_global()
-        elif isinstance(msg, PoseWithCovarianceStamped):
-            self.initialize_particles_pose(msg.pose.pose)
 
     def initialize_particles_pose(self, pose):
         """
         Initialize particles in the general region of the provided pose.
         """
-        self.get_logger().info("SETTING POSE")
-        self.get_logger().info(str([pose.position.x, pose.position.y]))
-        self.state_lock.acquire()
+
         self.weights = np.ones(self.MAX_PARTICLES) / float(self.MAX_PARTICLES)
         self.particles[:, 0] = pose.position.x + np.random.normal(
             loc=0.0, scale=0.5, size=self.MAX_PARTICLES
@@ -199,15 +190,13 @@ class ParticleFiler(object):
         self.particles[:, 2] = Utils.quaternion_to_angle(
             pose.orientation
         ) + np.random.normal(loc=0.0, scale=0.4, size=self.MAX_PARTICLES)
-        self.state_lock.release()
 
     def initialize_global(self):
         """
         Spread the particle distribution over the permissible region of the state space.
         """
-        self.get_logger().info("GLOBAL INITIALIZATION")
+
         # randomize over grid coordinate space
-        self.state_lock.acquire()
         permissible_x, permissible_y = np.where(self.permissible_region == 1)
         indices = np.random.randint(0, len(permissible_x), size=self.MAX_PARTICLES)
 
@@ -219,7 +208,6 @@ class ParticleFiler(object):
         Utils.map_to_world(permissible_states, self.map_info)
         self.particles = permissible_states
         self.weights[:] = 1.0 / self.MAX_PARTICLES
-        self.state_lock.release()
 
     def precompute_sensor_model(self):
         """
@@ -231,16 +219,15 @@ class ParticleFiler(object):
         """
         self.get_logger().info("Precomputing sensor model")
         # sensor model constants
-        z_short = self.Z_SHORT
-        z_max = self.Z_MAX
-        z_rand = self.Z_RAND
-        z_hit = self.Z_HIT
-        sigma_hit = self.SIGMA_HIT
+        z_short = self.config.z_short
+        z_max = self.config.z_max
+        z_rand = self.config.z_rand
+        z_hit = self.config.z_hit
+        sigma_hit = self.config.sigma_hit
 
-        table_width = int(self.MAX_RANGE_PX) + 1
+        table_width = int(self.max_range_px) + 1
         self.sensor_model_table = np.zeros((table_width, table_width))
 
-        t = time.time()
         # d is the computed range from RangeLibc
         for d in range(table_width):
             norm = 0.0
@@ -261,12 +248,12 @@ class ParticleFiler(object):
                     prob += 2.0 * z_short * (d - r) / float(d)
 
                 # erroneous max range measurement
-                if int(r) == int(self.MAX_RANGE_PX):
+                if int(r) == int(self.max_range_px):
                     prob += z_max
 
                 # random measurement
-                if r < int(self.MAX_RANGE_PX):
-                    prob += z_rand * 1.0 / float(self.MAX_RANGE_PX)
+                if r < int(self.max_range_px):
+                    prob += z_rand * 1.0 / float(self.max_range_px)
 
                 norm += prob
                 self.sensor_model_table[int(r), int(d)] = prob
@@ -433,8 +420,8 @@ class ParticleFiler(object):
             # resolve the sensor model by discretizing and indexing into the precomputed table
             obs /= float(self.map_info.resolution)
             ranges = self.ranges / float(self.map_info.resolution)
-            obs[obs > self.MAX_RANGE_PX] = self.MAX_RANGE_PX
-            ranges[ranges > self.MAX_RANGE_PX] = self.MAX_RANGE_PX
+            obs[obs > self.max_range_px] = self.max_range_px
+            ranges[ranges > self.max_range_px] = self.max_range_px
 
             intobs = np.rint(obs).astype(np.uint16)
             intrng = np.rint(ranges).astype(np.uint16)
