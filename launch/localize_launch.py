@@ -71,8 +71,8 @@ def generate_launch_description():
     )
 
     # finalize
-    ld.add_action(nav_lifecycle_node)
-    ld.add_action(map_server_node)
+    #ld.add_action(nav_lifecycle_node)
+    #ld.add_action(map_server_node)
     ld.add_action(pf_node)
 
     return ld
