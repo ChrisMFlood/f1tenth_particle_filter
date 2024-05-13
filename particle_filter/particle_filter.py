@@ -147,6 +147,8 @@ class ParticleFiler(Node):
         # initialize the state
         self.smoothing = Utils.CircularArray(10)
         self.timer = Utils.Timer(10)
+                # topic publishing timer
+        # self.timer = self.create_timer(0.004, self.timer_callback)
         # map service client
         self.map_client = self.create_client(GetMap, '/map_server/map')
         self.get_omap()
@@ -192,6 +194,8 @@ class ParticleFiler(Node):
             1)
 
         self.get_logger().info('Finished initializing, waiting on messages...')
+
+
 
     def get_omap(self):
         '''
@@ -674,7 +678,7 @@ class ParticleFiler(Node):
                 t2 = time.time()
 
                 # publish transformation frame based on inferred pose
-                self.publish_tf(self.inferred_pose, self.last_stamp)
+                # self.publish_tf(self.inferred_pose, self.last_stamp)
 
                 # this is for tracking particle filter speed
                 ips = 1.0 / (t2 - t1)
