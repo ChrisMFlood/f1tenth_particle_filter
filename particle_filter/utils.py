@@ -86,16 +86,6 @@ def particles_to_poses(particles):
     '''
     return list(map(particle_to_pose, particles))
 
-# DEPRECATED: should make the header inside the node now
-# def make_header(frame_id, stamp=None):
-#     ''' Creates a Header object for stamped ROS objects '''
-#     if stamp == None:
-#         stamp = rospy.Time.now()
-#     header = Header()
-#     header.stamp = stamp
-#     header.frame_id = frame_id
-#     return header
-
 def map_to_world_slow(x,y,t,map_info):
     ''' Converts given (x,y,t) coordinates from the coordinate space of the map (pixels) into world coordinates (meters).
         Provide the MapMetaData object from a map message to specify the change in coordinates.
