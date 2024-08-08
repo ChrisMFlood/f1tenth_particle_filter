@@ -293,7 +293,6 @@ class ParticleFiler(Node):
             if self.MAX_PARTICLES > self.MAX_VIZ_PARTICLES:
                 # randomly downsample particles
                 proposal_indices = np.random.choice(self.particle_indices, self.MAX_VIZ_PARTICLES, p=self.weights)
-                # proposal_indices = np.random.choice(self.particle_indices, self.MAX_VIZ_PARTICLES)
                 self.publish_particles(self.particles[proposal_indices,:])
             else:
                 self.publish_particles(self.particles)
@@ -487,6 +486,7 @@ class ParticleFiler(Node):
         # t1 = time.time()
         cosines = np.cos(proposal_dist[:,2])
         sines = np.sin(proposal_dist[:,2])
+        print(action)
 
         self.local_deltas[:,0] = cosines*action[0] - sines*action[1]
         self.local_deltas[:,1] = sines*action[0] + cosines*action[1]
